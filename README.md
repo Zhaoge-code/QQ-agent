@@ -19,13 +19,6 @@
 - **命令脚本** 内置命令脚本，可以实现API设置、发言频率修改、图片表情包识别开关。[具体参考部署手册](docs/deploy-docker.md#3-填配置命令行服务器上执行)
 > 具体架构还请参考[原作者](https://github.com/K0nd1us/QQ-agent)
 
-```bash
-npm install          # 装依赖
-npm start            # 桌面端启动
-npm run server       # headless 模式：浏览器打开 http://127.0.0.1:3210
-npm test             # 全部测试（149 项）：功能自测 + 前端渲染 + 滚动加载 + 用量端到端
-```
-
 ## 项目结构
 
 ```text
