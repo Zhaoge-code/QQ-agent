@@ -941,6 +941,60 @@ tr.quote-selected td { background: rgba(91,140,255,.10); }
 .banner a { color: var(--accent); }
 .banner.hidden { display: none; }
 
+/* ── 只读横幅（服务器部署）──
+   常驻顶部，一句话说清"这里只管看、改去哪儿改"。 */
+.ro-strip {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 18px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: rgba(91, 140, 255, .1);
+  border-bottom: 1px solid rgba(91, 140, 255, .35);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.ro-strip.hidden { display: none; }
+.ro-strip code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--text);
+}
+.ro-tag {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid rgba(91, 140, 255, .5);
+}
+
+/* ── 只读模式：锁死设置页 / SnowLuma 页的控件 ──
+   后端在只读模式下会 403，这里同步禁用是为了让人一眼看出"不能点"，
+   而不是点完才等到一句报错。
+   ⚠️ 刻意不覆盖：记忆页（内容维护，按需求放行）与顶部运营拨杆
+   （暂停/恢复、唤醒一次、标已读）。 */
+body.readonly .settings-pane input,
+body.readonly .settings-pane textarea,
+body.readonly .settings-pane select,
+body.readonly .settings-pane button,
+body.readonly .snowluma-pane input,
+body.readonly .snowluma-pane textarea,
+body.readonly .snowluma-pane select,
+body.readonly .snowluma-pane button {
+  pointer-events: none;
+  opacity: .5;
+  cursor: not-allowed;
+}
+/* label 也要失效，否则点文字仍能切换复选框 */
+body.readonly .settings-pane label { pointer-events: none; }
+body.readonly .readonly-note { color: var(--accent); }
+
 /* ── 体检卡 ── */
 .health-card {
   border: 1px solid var(--border);

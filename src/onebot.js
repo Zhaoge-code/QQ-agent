@@ -5,6 +5,12 @@ import { sanitizeUserText, escapeCqText } from './util.js';
 
 const RECONNECT_MIN_MS = 3000;
 const RECONNECT_MAX_MS = 30000;
+// 心跳：长期运行的机器人最怕"半开连接"——TCP 还在、事件却再也不来了，
+// 进程看起来一切正常，实际已经哑了（服务器 NAT 超时、对端进程假死都会这样）。
+// 每 45 秒发一次 WS ping；连续两轮（约 90 秒）没收到任何回音就作废连接重连。
+// 设 QQ_AGENT_WS_HEARTBEAT=0 可关闭（极少数不回应 ping 的协议端）。
+const HEARTBEAT_INTERVAL_MS = 45000;
+const HEARTBEAT_ENABLED = process.env.QQ_AGENT_WS_HEARTBEAT !== '0';
 
 export class OneBotClient {
   constructor({ wsUrl, httpUrl, accessToken, httpToken, onEvent }) {
@@ -24,6 +30,10 @@ export class OneBotClient {
   }
 
   #closedByUs;
+  #reconnectAttempt = 0;
+  #reconnectTimer = null;
+  #heartbeatTimer = null;
+  #awaitingPong = false;
 
   onStatus(fn) {
     this.statusListeners.add(fn);
@@ -40,6 +50,7 @@ export class OneBotClient {
 
   async connect() {
     this.#closedByUs = false;
+    this.#reconnectAttempt = 0;
     this.#connectLoop();
   }
 
@@ -50,8 +61,49 @@ export class OneBotClient {
     const old = this.socket;
     this.socket = null;
     this.#closedByUs = false;
+    this.#clearTimers();
+    this.#reconnectAttempt = 0;   // 手动重连 = 全新开始，退避从最小档重来
     try { old?.close(); } catch { /* ignore */ }
     this.#connectLoop();
+  }
+
+  /** 指数退避 + 抖动：3s→6s→12s→24s→30s 封顶。协议端没起来时不疯转、不刷日志。 */
+  #scheduleReconnect() {
+    if (this.#closedByUs) return;
+    clearTimeout(this.#reconnectTimer);
+    const base = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** Math.min(this.#reconnectAttempt, 6));
+    const delay = Math.round(base * (0.7 + Math.random() * 0.6));   // 抖动：避免多实例同步重连
+    this.#reconnectAttempt += 1;
+    this.#reconnectTimer = setTimeout(() => this.#connectLoop(), delay);
+  }
+
+  #clearTimers() {
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = null;
+    this.#stopHeartbeat();
+  }
+
+  #stopHeartbeat() {
+    if (this.#heartbeatTimer) { clearInterval(this.#heartbeatTimer); this.#heartbeatTimer = null; }
+    this.#awaitingPong = false;
+  }
+
+  /** 每个连接一个心跳定时器；ping 无回应就判定假死，terminate() 触发 close → 走重连。 */
+  #startHeartbeat(socket, isCurrent) {
+    this.#stopHeartbeat();
+    if (!HEARTBEAT_ENABLED) return;
+    this.#heartbeatTimer = setInterval(() => {
+      if (!isCurrent(socket)) { this.#stopHeartbeat(); return; }
+      if (this.#awaitingPong) {
+        this.lastConnectError = '心跳超时（WS ping 无响应），判定连接已死，稍后重连';
+        this.#stopHeartbeat();
+        try { socket.terminate(); } catch { /* ignore */ }
+        return;
+      }
+      this.#awaitingPong = true;
+      try { socket.ping(); } catch { /* ignore */ }
+    }, HEARTBEAT_INTERVAL_MS);
+    this.#heartbeatTimer.unref?.();   // 心跳不该阻止进程正常退出
   }
 
   #connectLoop() {
@@ -66,7 +118,7 @@ export class OneBotClient {
     } catch (error) {
       this.lastConnectError = String(error?.message ?? error);
       this.#setStatus(false);
-      setTimeout(() => this.#connectLoop(), RECONNECT_MIN_MS);
+      this.#scheduleReconnect();
       return;
     }
     this.socket = socket;
@@ -77,6 +129,8 @@ export class OneBotClient {
     socket.on('open', async () => {
       if (!isCurrent(socket)) return;
       this.lastConnectError = '';
+      this.#reconnectAttempt = 0;   // 连上了，退避归零
+      this.#startHeartbeat(socket, isCurrent);
       this.#setStatus(true);
       try {
         this.selfInfo = await this.call('get_login_info');
@@ -86,6 +140,7 @@ export class OneBotClient {
     });
     socket.on('message', (data) => {
       if (!isCurrent(socket)) return;
+      this.#awaitingPong = false;   // 有数据进来就说明连接活着
       let event = null;
       try { event = JSON.parse(String(data)); } catch { return; }
       if (!event || typeof event !== 'object') return;
@@ -93,8 +148,13 @@ export class OneBotClient {
     });
     socket.on('close', () => {
       if (!isCurrent(socket)) return; // 旧连接的迟到 close：新连接已在处理
+      this.#stopHeartbeat();
       this.#setStatus(false);
-      if (!this.#closedByUs) setTimeout(() => this.#connectLoop(), RECONNECT_MIN_MS);
+      if (!this.#closedByUs) this.#scheduleReconnect();
+    });
+    socket.on('pong', () => {
+      if (!isCurrent(socket)) return;
+      this.#awaitingPong = false;
     });
     socket.on('error', (error) => {
       if (!isCurrent(socket)) return;
@@ -108,6 +168,7 @@ export class OneBotClient {
 
   close() {
     this.#closedByUs = true;
+    this.#clearTimers();
     const old = this.socket;
     this.socket = null;
     try { old?.close(); } catch { /* ignore */ }

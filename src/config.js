@@ -197,7 +197,13 @@ export const DEFAULT_CONFIG = {
   // 桌面端/控制台
   server: {
     port: 3210,
-    token: '',                // 留空 = 只监听 127.0.0.1
+    host: '127.0.0.1',        // 监听地址。127.0.0.1 = 只有本机能访问（最安全）；
+                              // Docker 里必须 0.0.0.0，否则端口映射不出来。
+                              // 也可用环境变量 QQ_AGENT_HOST / QQ_AGENT_PORT 覆盖。
+    strictPort: false,        // true = 端口被占用直接报错，不自动往后让位。
+                              // 容器/服务器建议开（或设 QQ_AGENT_STRICT_PORT=1），
+                              // 否则服务可能悄悄跑在 3211 上，排查时很迷惑。
+    token: '',                // 控制台访问令牌；走 SSH 隧道时不需要（来源是 127.0.0.1）
     autoStart: false,         // 开机自启（仅 Electron 桌面端生效）
     closeToTray: true         // 点关闭 = 最小化到托盘
   },

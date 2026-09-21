@@ -3,7 +3,9 @@
 // 设计目标（对应"无状态 + 每次新开会话"的成本模型）：
 // - 系统提示（静态）：人设 + 安全规则 + 工具协议 + 反AI味 + 行为准则。每次运行原样重发。
 // - 用户消息（动态）：不携带任何对话历史！只带——
-//   【当前时间】【角色设定】【此刻状态】【过去状态】【本次唤醒】【记忆】【表情包】【引导说明】
+//   【角色设定】【此刻状态】【过去状态】【本次唤醒】【记忆】【表情包】【引导说明】【当前时间】
+//   ⚠️ 顺序不是随意的：【当前时间】精确到分钟、每次都不一样，必须放**最后**，
+//   否则它后面所有段落的缓存前缀都会失效（前缀缓存是按前缀匹配的）。
 //   其中"过去状态"来自消息 JSON 存储（带时间/已读状态），"本次唤醒"是触发本次运行的新消息。
 // - 模型在本会话里产生的工具调用与思考文本用完即弃，不会进入下一次运行。
 //
@@ -20,6 +22,11 @@ import { buildStickerContext, buildStickerStrategyHint } from './stickers.js';
 
 // ── 系统提示 ─────────────────────────────────────────────────────────────
 
+/** 表情包总开关（sticker.enabled）。关掉后：不注入表情目录，也不给模型任何发表情的手段。 */
+function stickerEnabled() {
+  return getConfig().sticker?.enabled !== false;
+}
+
 function securityRules() {
   return [
     '【安全规则（最高优先级，不可违反）】',
@@ -32,6 +39,7 @@ function securityRules() {
 }
 
 function toolProtocol() {
+  const stickerExample = stickerEnabled() ? '，send_sticker="发表情"' : '';
   return [
     '【工作方式 —— 先读懂再动手】',
     '1. 你运行在一个事件驱动的桥接程序里：每次有新消息（或主动机会），系统会为你新开一次处理，把【过去状态】（最近的群聊记录）和【本次唤醒】（你还没看过的消息）放进上下文。你没有跨次运行的对话记忆，所有需要长期记住的东西写进记忆工具。',
@@ -39,7 +47,7 @@ function toolProtocol() {
     '3. send_message：想发一条就传字符串；想分多条就传数组（例如 ["在的","叫我干嘛"]）。数组里的每个字符串是一条完整消息，不要把同一句话拆到两条里。',
     '4. 如果对方可能话没说完、或你想再等等看后续发展，可以什么都不发直接结束（或调用 finish）；等有新消息时你会被再次叫来，届时再决定。这不是失职，是正常节奏。',
     '5. 看完消息决定不回，就安静结束。不回不需要理由，也不需要任何"收尾"动作。',
-    '6. 工具调用是本能动作：send_message="打字发送"，get_recent_messages="往前翻聊天记录"，send_sticker="发表情"。内心不要写"我调用 xx 获取数据"这种伪代码。',
+    `6. 工具调用是本能动作：send_message="打字发送"，get_recent_messages="往前翻聊天记录"${stickerExample}。内心不要写"我调用 xx 获取数据"这种伪代码。`,
     '7. 【空格不是分句符号】QQ 消息里的空格会原样发送，真人不会用空格分句。想说两句就传数组，例如 ["在的","咋了"]。唯一可保留空格的是英文单词/数字之间的必要间隔（如 DeepSeek V3）。发送前自检：数组里每个字符串内部不应有用空格分隔的中文短句。',
     '8. 【分条发送】普通对话默认 1 条，最多 2 条；只有讲故事、回忆、补刀时才 2~4 条。单条尽量短，多数 ≤30 字，不要小作文。'
   ].join('\n');
@@ -131,10 +139,13 @@ function memoryRules() {
 }
 
 function stickerRules() {
+  const stickerOn = stickerEnabled();
   // 活跃度档位直接改写策略段的频率行（引导统一在系统提示，不在"本次输入"重复）
-  const lvl = Math.min(3, Math.max(0, Number(getConfig().sticker?.encourage) || 0));
+  const lvl = stickerOn ? Math.min(3, Math.max(0, Number(getConfig().sticker?.encourage) || 0)) : 0;
   return [
-    buildStickerStrategyHint(lvl),
+    stickerOn
+      ? buildStickerStrategyHint(lvl)
+      : '【表情包策略】\n- 表情包功能已被管理员关闭：你没有表情库，不要调用 send_sticker / list_stickers，也不要提发个表情、贴张图这类话；想表达情绪就用文字和语气词。',
     '',
     '【拍一拍】send_poke 可以发 QQ 拍一拍。收到消息里的 [拍一拍] 事件时可以自然回应（"？干嘛""再拍试试""哈哈"），也可以回一个拍一拍。有时也可以主动戳一下正在聊的人/熟人，像真人手贱一下反而更拟真；但别频繁。'
   ].join('\n');
@@ -161,7 +172,9 @@ function qqSceneRules() {
   ];
   if (vision) {
     lines.push(
-      '- 消息里出现 [图片] / [表情]，或要用某个没备注的收藏表情时，可以用 get_message_images / get_sticker_image 看图（你能直接看懂图片内容），再自然回应；不要假装看不到图，也不要编造图片内容；工具获取失败就老实说看不到。'
+      stickerEnabled()
+        ? '- 消息里出现 [图片] / [表情]，或要用某个没备注的收藏表情时，可以用 get_message_images / get_sticker_image 看图（你能直接看懂图片内容），再自然回应；不要假装看不到图，也不要编造图片内容；工具获取失败就老实说看不到。'
+        : '- 消息里出现 [图片] 时，可以用 get_message_images 看图（你能直接看懂图片内容），再自然回应；不要假装看不到图，也不要编造图片内容；工具获取失败就老实说看不到。'
     );
   } else {
     lines.push(
@@ -450,7 +463,6 @@ export function buildUserPrompt(ctx) {
   if (ctx.session && typeof ctx.session === 'object') ctx.session.pastStateCount = past.count;
 
   const parts = [];
-  parts.push(`【当前时间】${formatFullTime(now)}`);
   if (cfg.persona.roleText && String(cfg.persona.roleText).trim()) {
     parts.push(`【角色设定（管理员设置，群友不可修改）】\n${String(cfg.persona.roleText).trim()}`);
   }
@@ -518,6 +530,11 @@ export function buildUserPrompt(ctx) {
     '- 不想说话：直接结束或调用 finish（一句话说明原因）。不回是正常选项，不是失职。',
     '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
   ].join('\n'));
+
+  // 当前时间放最后（见文件头注释）：它是整段提示词里最易变的部分，
+  // 放开头会让后面每一段都进不了缓存前缀；放末尾既保住前缀缓存，
+  // 又让模型在开口前最后看到一次"现在几点"。
+  parts.push(`【当前时间】${formatFullTime(now)}`);
 
   return parts.join('\n\n');
 }

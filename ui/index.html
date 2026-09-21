@@ -42,10 +42,18 @@
 
   <div id="banner" class="banner hidden" data-page-node-id="XwcKf16gobwX1Rec9tqlEn"></div>
 
+  <!-- 只读模式横幅（服务器部署）：控制台只当监控看板，配置一律走命令行。
+       显示与否由 app.js 按 /api/status 的 readonly 字段决定。 -->
+  <div id="ro-strip" class="ro-strip hidden">
+    <span class="ro-tag">只读</span>
+    <span>服务器模式：控制台仅供监控，配置项已锁定。改配置请在服务器上执行
+      <code>docker compose exec qq-agent node bin/qq-agent.mjs</code>（保存后自动热重载，无需重启）。</span>
+  </div>
+
   <div id="loading-overlay" class="loading-overlay" data-page-node-id="MpXTOwnEFQFI3iciufCGwk">
     <div class="loading-card" data-page-node-id="boXG4AHTg9zdLRzAkPQU0d">
       <div class="loading-title" data-page-node-id="Jd8xjaha2bCfyriCNfs8Tn">QQ Agent 正在启动</div>
-      <div class="loading-sub" id="loading-status" data-page-node-id="pnFkOCeJYMuEWqSGBEF5NX">正在启动 SnowLuma 与 OneBot 服务，请稍候…</div>
+      <div class="loading-sub" id="loading-status" data-page-node-id="pnFkOCeJYMuEWqSGBEF5NX">正在启动后端服务并连接 OneBot，请稍候…</div>
       <div class="loading-spinner" data-page-node-id="pVvSFcW7FhjA5K8LpxpM5o"></div>
       <pre class="loading-logs" id="loading-logs" data-page-node-id="qCOILAMT7FkCZFYCEKYo4o"></pre>
     </div>

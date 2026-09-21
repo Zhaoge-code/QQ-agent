@@ -17,6 +17,10 @@ import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 
+// 表情包相关工具：sticker.enabled=false 时整组下架。
+// 只停掉提示词里的目录注入是不够的 —— 工具还挂在工具表里，模型照样能调用 send_sticker 真发出去。
+const STICKER_TOOLS = new Set(['send_sticker', 'list_stickers', 'get_sticker_image', 'sticker_note', 'collect_sticker']);
+
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null }) {
     this.store = store;
@@ -460,13 +464,16 @@ export class Orchestrator {
     session.inputMessages = structuredClone(messages.map((m) => ({ role: m.role, content: m.content })));
     this.sessions.update(session.id);
 
-    // 工具集按配置过滤：无视觉模型 → 移除看图工具；搜索关闭 → 移除联网工具
+    // 工具集按配置过滤：无视觉模型 → 移除看图工具；表情包关闭 → 移除表情工具；搜索关闭 → 移除联网工具
     // 视觉判定 = 全局开关 && 选中模型未被探测为"明确不支持图片"（未探测/unknown 时保持开关行为）
     const visionEnabled = cfg.api.vision !== false
       && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
     const searchEnabled = cfg.webSearch?.enabled !== false;
+    const stickerEnabled = cfg.sticker?.enabled !== false;
     const toolDefs = this.toolDefs.filter((d) => {
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
+      // 表情包关闭要把「发/列/收藏/备注表情」整条链路一起摘掉
+      if (!stickerEnabled && STICKER_TOOLS.has(d.name)) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       return true;
     });

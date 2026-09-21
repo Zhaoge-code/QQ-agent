@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
+import { getConfig, updateConfig, setRuntimeConfig, loadConfig, ROOT, DATA_DIR } from './config.js';
 import { customSearch } from './web-search.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments, expandForwardNodes } from './onebot.js';
 import { ChatStore } from './store.js';
@@ -69,6 +69,85 @@ function compareSemver(a, b) {
     if ((pa[i] || 0) < (pb[i] || 0)) return -1;
   }
   return 0;
+}
+
+// ── 只读模式 ─────────────────────────────────────────────────────────────
+// QQ_AGENT_READONLY=1：机器人跑在服务器上，控制台只当监控看板用。
+// 配置一律走 bin/qq-agent.mjs（命令行），避免"能开浏览器的设备就能拿走密钥"。
+//
+// 放行的写接口只有"运营拨杆"—— 暂停/恢复、手动唤醒一次、标已读。
+// 另外 /api/media-data 虽然是 POST，但它只是把图片转成 dataURL 给页面显示
+// （本质是读，用 POST 只是因为要批量传参），禁掉监控页就看不了图，所以一并放行。
+const READ_ONLY = process.env.QQ_AGENT_READONLY === '1';
+const READONLY_ALLOWED_WRITES = [
+  /^\/api\/pause$/,
+  /^\/api\/chats\/(group|private)_\d+\/wake$/,
+  /^\/api\/chats\/(group|private)_\d+\/mark-read$/,
+  /^\/api\/media-data$/,
+  // 记忆编辑按需求放行：它是"内容维护"，不是模型/密钥这类配置。
+  /^\/api\/memory-files\/(group|private)_\d+\/members\/\d+$/,
+  /^\/api\/memory-files\/consolidate$/
+];
+
+// 明文密钥接口：平时靠"请求来源校验"保护（非本机 Host 一律 403）。
+// 只读模式下无条件封死 —— 控制台不该成为取走 API Key 的通道。
+const PLAINTEXT_KEY_ENDPOINTS = new Set(['/api/api-key', '/api/search-key', '/api/providers/key']);
+
+const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
+
+/** 控制台访问令牌：环境变量 QQ_AGENT_TOKEN 优先于 config.json 的 server.token。 */
+function consoleToken() {
+  return String(process.env.QQ_AGENT_TOKEN || getConfig().server?.token || '');
+}
+
+/**
+ * 控制台监听配置。环境变量优先于配置文件 —— 容器里改环境变量比改 JSON 方便，
+ * 而 data/config.json 属于运行时数据，容器重建时不该依赖它。
+ *   QQ_AGENT_HOST         监听地址，默认 127.0.0.1（只有本机能访问，最安全）
+ *   QQ_AGENT_PORT         监听端口，默认取配置 server.port（3210）
+ *   QQ_AGENT_STRICT_PORT  设为 1 时端口被占直接报错，不自动往后找
+ *   QQ_AGENT_TOKEN        控制台访问令牌（不设则用 config.json 的 server.token）
+ */
+function serverBindConfig() {
+  const server = getConfig().server || {};
+  const host = String(process.env.QQ_AGENT_HOST || server.host || '127.0.0.1').trim() || '127.0.0.1';
+  const port = Number(process.env.QQ_AGENT_PORT || server.port) || 3210;
+  const strictPort = process.env.QQ_AGENT_STRICT_PORT === '1' || server.strictPort === true;
+  return { host, port, strictPort, token: consoleToken() };
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+function isLoopbackHost(host) {
+  return LOOPBACK_HOSTS.has(String(host || '').toLowerCase());
+}
+
+/**
+ * 用系统默认程序打开目录或链接。
+ * 服务器（无桌面环境）上必然打不开，这里返回 { ok:false, error } 让调用方给出人话提示，
+ * 而不是 spawn 一个不存在的 xdg-open、然后什么都不发生。
+ */
+function openExternal(target, { isUrl = false } = {}) {
+  try {
+    if (IS_WIN) {
+      const child = isUrl
+        ? spawn('cmd.exe', ['/c', 'start', '', target], { detached: true, stdio: 'ignore', windowsHide: true })
+        : spawn('explorer.exe', [target], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+      return { ok: true };
+    }
+    if (IS_MAC) {
+      spawn('open', [target], { detached: true, stdio: 'ignore' }).unref();
+      return { ok: true };
+    }
+    if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+      return { ok: false, error: `服务器上没有桌面环境，请手动打开：${target}` };
+    }
+    spawn('xdg-open', [target], { detached: true, stdio: 'ignore' }).unref();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
 }
 
 export function createApp({ log = console.log } = {}) {
@@ -696,6 +775,18 @@ export function createApp({ log = console.log } = {}) {
 
     if (pathname.startsWith('/api/')) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
+
+      // ── 只读模式拦截 ──
+      // 放在业务逻辑最前面：所有写操作在进入任何处理之前就被挡掉，避免漏网的接口变成后门。
+      if (READ_ONLY) {
+        if (PLAINTEXT_KEY_ENDPOINTS.has(pathname)) {
+          return json(res, 403, { error: '只读模式：密钥读取接口已禁用。配置请用命令行（bin/qq-agent.mjs）' });
+        }
+        if (req.method !== 'GET' && !READONLY_ALLOWED_WRITES.some((re) => re.test(pathname))) {
+          return json(res, 403, { error: '只读模式：控制台只用于监控。改配置请执行 docker compose exec qq-agent node bin/qq-agent.mjs（改完自动热重载）' });
+        }
+      }
+
       const method = req.method;
       const cfgNow = getConfig();
 
@@ -706,6 +797,7 @@ export function createApp({ log = console.log } = {}) {
         // 成本估算：命中官方价走官方价，否则用手填单价
         const cost = estimateCost(usage, { model: cfgNow.api?.model });
         return json(res, 200, {
+          readonly: READ_ONLY,
           onebot: {
             connected: onebot.connected,
             everConnected: onebot.everConnected,
@@ -801,15 +893,15 @@ export function createApp({ log = console.log } = {}) {
       if (pathname === '/api/snowluma/open-folder' && method === 'POST') {
         const dir = snowlumaDir();
         if (!dir) return json(res, 400, { ok: false, error: '找不到 SnowLuma 目录' });
-        spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore' }).unref();
-        return json(res, 200, { ok: true });
+        const opened = openExternal(dir);
+        return json(res, opened.ok ? 200 : 400, opened);
       }
 
       if (pathname === '/api/snowluma/open-webui' && method === 'POST') {
         const webuiUrl = snowlumaWebuiUrl();
         if (!webuiUrl) return json(res, 400, { ok: false, error: '没有找到 SnowLuma WebUI 地址（等日志出现 listening 后再试）' });
-        spawn('cmd.exe', ['/c', 'start', '', webuiUrl], { detached: true, stdio: 'ignore' }).unref();
-        return json(res, 200, { ok: true, webuiUrl });
+        const opened = openExternal(webuiUrl, { isUrl: true });
+        return json(res, opened.ok ? 200 : 400, { ...opened, webuiUrl });
       }
 
       // ── 体检/引导相关 ──
@@ -1550,10 +1642,58 @@ export function createApp({ log = console.log } = {}) {
   // DSH 自动导入已移除：模型目录改为在设置页手动维护（见 /api/providers 相关接口）。
 
   // ── 启停 ──
-  async function listenOn(port) {
+  /**
+   * 重新从磁盘加载配置并应用到运行中的组件（由 bin/qq-agent.mjs 发 SIGHUP 触发）。
+   *
+   * 绝大多数模块是"用的时候现读 getConfig()"（人设、白名单、响应档位、关键词、限频、
+   * 发送节奏、模型、记忆整理、表情包、Vision、搜索服务…），所以换掉内存里的配置就够了。
+   * 只有启动时读过一次的那几项需要在这里显式再应用一遍。
+   *
+   * 只读盘、不回写 —— 写盘的唯一入口是 CLI，避免两边互相覆盖。
+   * 返回被重新应用的项，供日志显示。
+   */
+  function reloadConfig() {
+    const before = getConfig();
+    const next = loadConfig();
+    setRuntimeConfig(next);
+    const applied = [];
+
+    // 1) 单群消息上限（ChatStore 构造时传入）
+    const maxPerChat = Number(next.store?.maxMessagesPerChat) || 0;
+    if (maxPerChat !== store.maxPerChat) { store.setMaxPerChat(maxPerChat); applied.push('单群消息上限'); }
+
+    // 2) 会话留档保留数（SessionRegistry 构造时传入）
+    const keepFiles = Math.max(0, Number(next.store?.keepSessionFiles) || 0);
+    if (keepFiles !== sessions.keepFiles) { sessions.keepFiles = keepFiles; applied.push('会话留档保留数'); }
+
+    // 3) OneBot 连接参数（构造时传入）：地址或令牌真的变了才重连，避免无谓断线
+    const wsUrl = String(next.snowluma?.wsUrl || onebot.wsUrl);
+    const httpUrl = String(next.snowluma?.httpUrl || onebot.httpUrl).replace(/\/+$/, '');
+    const accessToken = String(next.snowluma?.accessToken || '');
+    const httpToken = String(next.snowluma?.httpAccessToken || accessToken || '');
+    const connChanged = wsUrl !== onebot.wsUrl || httpUrl !== onebot.httpUrl
+      || accessToken !== onebot.accessToken || httpToken !== onebot.httpToken;
+    onebot.wsUrl = wsUrl;
+    onebot.httpUrl = httpUrl;
+    onebot.accessToken = accessToken;
+    onebot.httpToken = httpToken;
+    if (connChanged) { onebot.reconnect(); applied.push('OneBot 连接'); }
+
+    // 4) 主动开话题循环（只在启动时决定起不起）
+    if (Boolean(next.proactive?.enabled) !== Boolean(before.proactive?.enabled)) {
+      if (next.proactive?.enabled) orchestrator.startProactiveLoop();
+      else orchestrator.stopProactiveLoop();
+      applied.push('主动开话题');
+    }
+
+    emit('config-reloaded', { at: Date.now(), applied });
+    return applied;
+  }
+
+  async function listenOn(port, host) {
     return new Promise((resolve, reject) => {
       server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(port, host, () => {
         server.off('error', reject);
         resolve(port); // 必须把实际端口传回去，Electron 壳要用它加载页面
       });
@@ -1562,12 +1702,37 @@ export function createApp({ log = console.log } = {}) {
 
   async function start() {
     // 先把 HTTP 服务拉起来，让窗口/浏览器立刻能加载页面（loading 壳）
-    const basePort = Number(getConfig().server?.port) || 3210;
+    const bind = serverBindConfig();
+    const basePort = bind.port;
+
+    // 监听非本机地址 = 把控制台暴露到网络上，而控制台里有"显示明文 API Key"的接口。
+    // 那种情况下必须带访问令牌，否则直接拒绝启动 —— 宁可起不来，也不要裸奔的密钥面板。
+    if (!isLoopbackHost(bind.host) && !bind.token) {
+      // 容器部署有个绕不开的矛盾：容器内必须监听 0.0.0.0 端口映射才通，
+      // 但端口可以只发布到宿主机的 127.0.0.1，外面根本连不上。
+      // 这种情况用 QQ_AGENT_ALLOW_OPEN_BIND=1 显式声明"我知道自己在做什么"，
+      // 而不是把这条保护删掉 —— 裸机部署忘设令牌时它仍然能救命。
+      if (process.env.QQ_AGENT_ALLOW_OPEN_BIND !== '1') {
+        throw new Error(
+          `拒绝启动：监听地址是 ${bind.host}（非本机），但访问令牌为空。` +
+          '控制台里可以查看明文 API Key，暴露到网络前必须设访问令牌：' +
+          '设环境变量 QQ_AGENT_TOKEN=<随机长字符串>，或在 data/config.json 里填 server.token。' +
+          '若这是容器部署、且端口只发布到宿主机 127.0.0.1，可设 QQ_AGENT_ALLOW_OPEN_BIND=1 跳过本检查。'
+        );
+      }
+      log(`[安全] QQ_AGENT_ALLOW_OPEN_BIND=1：允许无令牌监听 ${bind.host}。` +
+          '请确认端口只发布到了 127.0.0.1（compose 里写成 "127.0.0.1:3210:3210"）。');
+    }
+
     let port = null;
     let lastError = null;
-    for (let p = basePort; p < basePort + 10; p++) {
+    // 容器/服务器部署开 strictPort：端口被占就报错退出（交给 restart 策略拉起并告警），
+    // 而不是悄悄换到 3211 —— 那会让人以为服务在 3210，排查起来莫名其妙。
+    // 桌面端保留"自动让位"的原行为。
+    const maxTries = bind.strictPort ? 1 : 10;
+    for (let p = basePort; p < basePort + maxTries; p++) {
       try {
-        port = await listenOn(p);
+        port = await listenOn(p, bind.host);
         break;
       } catch (error) {
         lastError = error;
@@ -1604,7 +1769,9 @@ export function createApp({ log = console.log } = {}) {
     }
     await onebot.connect();
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
-    log(`控制台已就绪：http://127.0.0.1:${port}`);
+    const shownHost = isLoopbackHost(bind.host) ? '127.0.0.1' : bind.host;
+    log(`控制台已就绪：http://${shownHost}:${port}${READ_ONLY ? '（只读模式：仅供监控）' : ''}`);
+    if (READ_ONLY) log('只读模式已开启：配置请用 `docker compose exec qq-agent node bin/qq-agent.mjs`，改完自动热重载');
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
     return port;
@@ -1613,14 +1780,21 @@ export function createApp({ log = console.log } = {}) {
   async function stop() {
     await orchestrator.abortAll();
     onebot.close();
+    // 先断开所有长连接（主要是控制台页面的 SSE）：否则 server.close() 要等它们
+    // 自己断开才算关掉，docker stop 时会被硬拖到超时。
+    for (const res of sseClients) {
+      try { res.end(); } catch { /* ignore */ }
+    }
+    sseClients.clear();
     server.close();
+    server.closeAllConnections?.();
     // 内置启动的 SnowLuma：QQ Agent 退出时一并关掉，避免留一个无窗口的后台进程。
     // 注意：SnowLuma 退出时不一定能立刻把 config 落盘，但我们的 stop 不会再去读它，
     // 下次启动会读到完整文件。
     try { snowlumaProc?.kill(); } catch { /* ignore */ }
   }
 
-  return { server, onebot, store, memory, stickers, sender, sessions, orchestrator, start, stop, emit, getConfig, updateConfig, launchSnowluma, stopSnowluma, snowlumaStatus };
+  return { server, onebot, store, memory, stickers, sender, sessions, orchestrator, start, stop, reloadConfig, emit, getConfig, updateConfig, launchSnowluma, stopSnowluma, snowlumaStatus };
 }
 
 /**

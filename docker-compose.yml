@@ -1,0 +1,136 @@
+# QQ Agent —— Docker 部署（机器人本体）
+#
+#   docker compose up -d
+#   docker compose logs -f
+#
+# 这个文件里有**两个**服务，两个都起来才算一个能聊天的机器人：
+#   qq-agent —— 机器人本体 + 控制台（本项目，从 ./Dockerfile 构建）
+#   napcat   —— 协议端，登录机器人 QQ 号、提供 OneBot v11 接口（官方镜像）
+#
+# 打开控制台（在你自己的 Windows 电脑上执行，不是服务器上）：
+#   ssh -N -L 8321:127.0.0.1:3210 你的用户名@服务器IP
+#   浏览器访问 http://127.0.0.1:8321
+#
+# 改配置（在服务器上执行，控制台是只读的）：
+#   docker compose exec qq-agent node bin/qq-agent.mjs show
+#   docker compose exec qq-agent node bin/qq-agent.mjs set-api --base-url … --key … --model …
+#   docker compose exec qq-agent node bin/qq-agent.mjs set-onebot --ws ws://napcat:3001 --http http://napcat:3000
+#   docker compose exec qq-agent node bin/qq-agent.mjs set-allow group:123456
+
+services:
+  qq-agent:
+    build:
+      context: .
+      # 服务器上访问官方 npm 源慢/不通时，在 .env 里写 NPM_REGISTRY=https://registry.npmmirror.com
+      args:
+        NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
+        # 基础镜像拉不动（服务器连不上 Docker Hub）时，在 .env 里写镜像站地址，例如：
+        #   NODE_IMAGE=docker.m.daocloud.io/library/node:22-bookworm-slim
+        NODE_IMAGE: "${NODE_IMAGE:-node:22-bookworm-slim}"
+    image: qq-agent:local
+    container_name: qq-agent
+    restart: unless-stopped
+    # 日志轮转：7×24 跑几个月，不限制的 json-file 日志会把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      # ⚠ 必须带 127.0.0.1: 前缀：只有服务器本机能连，外部一律走 SSH 隧道。
+      #   写成 "3210:3210" 会把控制台挂到公网（里面有聊天存档，没必要让人随便看）。
+      - "127.0.0.1:3210:3210"
+    environment:
+      TZ: Asia/Shanghai
+      QQ_AGENT_DATA_DIR: /data
+      # 容器内必须监听 0.0.0.0 端口映射才通；对外是否可达由上面的 ports 决定
+      QQ_AGENT_HOST: 0.0.0.0
+      QQ_AGENT_PORT: "3210"
+      QQ_AGENT_STRICT_PORT: "1"
+      # 配合 ports 的 127.0.0.1 前缀，放行"无令牌监听"（详见 Dockerfile 注释）
+      QQ_AGENT_ALLOW_OPEN_BIND: "1"
+      # 控制台只读：只能看状态/会话/存档/记忆/用量，外加暂停、唤醒、标已读
+      QQ_AGENT_READONLY: "1"
+      # 不想参与匿名用量上报（只有计数器与随机 ID，不含聊天内容）就打开
+      # QQ_AGENT_NO_TELEMETRY: "1"
+    volumes:
+      - qq-agent-data:/data
+      # 具名卷在个别云主机上属主怎么改都不对（宿主机显示 1000:1000、容器里看还是 root）。
+      # 真碰上了就换成项目目录下的 bind mount，先在宿主机上建好目录并改属主：
+      #   mkdir -p ./data && chown -R 1000:1000 ./data
+      # 然后把上面那行换成：
+      #   - ./data:/data
+    # 协议端装在宿主机上时，用它代替 127.0.0.1 访问宿主机
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3210/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── 协议端：NapCat（官方镜像）─────────────────────────────────────────
+  # 它负责登录机器人 QQ 号、对外提供 OneBot v11 接口，和 qq-agent 分开升级、分开重启。
+  napcat:
+    image: mlikiowa/napcat-docker:v4.18.28
+    container_name: napcat
+    restart: unless-stopped
+    # QQ 要收到 SIGINT 才走正常退出流程；默认的 SIGTERM 会先把 bash(PID 1) 干掉，
+    # QQ 来不及收尾，容易留下 /tmp/.X1-lock 之类的残留。
+    stop_signal: SIGINT
+    # 给收尾留足时间：默认只等 10 秒，超时会被 SIGKILL —— QQ 来不及把会话写干净，
+    # 下次启动就可能要重新扫码。20~30 秒基本都能收干净。
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      TZ: Asia/Shanghai
+      # 让容器写出来的文件属主 = 宿主机上跑 compose 的那个用户。默认 1000:1000，
+      # 部署前用 `id -u` / `id -g` 核一下，或者写进 .env：
+      #   NAPCAT_UID=1000
+      #   NAPCAT_GID=1000
+      NAPCAT_UID: "${NAPCAT_UID:-1000}"
+      NAPCAT_GID: "${NAPCAT_GID:-1000}"
+      # 填上机器人 QQ 号，NapCat 启动时就直奔它的登录页（不填也行，WebUI 里手动输）
+      ACCOUNT: "${NAPCAT_ACCOUNT:-}"
+      # 不设的话 WebUI 的 token 是随机密码，启动日志里会打出来：
+      #   docker compose logs napcat | grep -i token
+      # WEBUI_TOKEN: "${NAPCAT_WEBUI_TOKEN}"
+      # ⚠ 千万别加 MODE：entrypoint 每次启动都会拿镜像里的模板覆盖
+      #   /app/napcat/config/onebot11.json，而官方 ws 模板只开 WebSocket、不开 HTTP，
+      #   结果就是"消息收得到、一条也发不出去"。
+    ports:
+      # 只有扫码/首次登录用的 WebUI 需要发布，而且同样只给本机，一样走 SSH 隧道
+      - "127.0.0.1:6099:6099"
+    volumes:
+      # 登录态：删了就得重新扫码，别动它
+      - ./napcat/QQ:/app/.config/QQ
+      # NapCat 侧配置：仓库里带了预置的 onebot11.json（WS 3001 + HTTP 3000 都开）
+      - ./napcat/config:/app/napcat/config
+
+volumes:
+  qq-agent-data:
+
+# ── 协议端（NapCat）怎么接 ───────────────────────────────────────────────
+# 两个服务在同一条 compose 网络里，直接用服务名互访，所以 3000/3001 不用发布到宿主机：
+#
+#   docker compose exec qq-agent node bin/qq-agent.mjs set-onebot \
+#     --ws ws://napcat:3001 --http http://napcat:3000
+#
+# 首次部署的顺序：
+#   1) docker compose up -d napcat
+#   2) docker compose logs -f napcat            等它打出 WebUI token
+#   3) 在自己电脑上开隧道：ssh -N -L 6099:127.0.0.1:6099 用户名@服务器IP
+#      浏览器打开 http://127.0.0.1:6099/webui ，用日志里的 token 登录，扫码登机器人 QQ
+#   4) docker compose up -d qq-agent            然后执行上面那条 set-onebot
+#
+# 硬性要求：NapCat 的 WebSocket 服务器和 HTTP 服务器**都要开**。
+# 机器人收事件走 WS，但所有动作（含发消息）走 HTTP API；
+# 只开 WS 的表现就是"消息收得到、一条也发不出去"。
+# 这两个开关写在 ./napcat/config/onebot11.json（本仓库预置），想改就改它，或登录后在 WebUI 的网络配置里改。
+#
+# ./napcat/ 整个目录都是运行时数据（登录态 + 可能带 token 的配置），已经在 .gitignore 里挡掉了。

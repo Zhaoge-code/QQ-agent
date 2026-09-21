@@ -1,0 +1,44 @@
+# 运行时数据：聊天记录 / 群友记忆 / 含 API Key 的 config.json —— 绝不能进镜像
+data/
+logs/
+*.log
+
+# 依赖与构建产物（容器里重新装）
+node_modules/
+dist/
+release/
+
+# 第三方协议端：体积大，且是别人家的东西，不进镜像
+snowluma/
+
+# NapCat 协议端的运行时目录：登录态（含 QQ 凭据）可能几百 MB，绝不能烤进镜像
+napcat/
+
+# 版本库与开发/文档
+.git/
+.gitignore
+.github/
+docs/
+test/
+scripts/
+build/
+
+# 桌面端与 Windows 专用文件
+electron/
+启动QQ机器人.bat
+*.exe
+*.msi
+assets/icon.ico
+
+# 其他
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp
+*.bak
+package-lock.json.bak
+
+# 手动打包上传的压缩包：白白撑大构建上下文，也不该进镜像
+*.tgz
+*.tar.gz

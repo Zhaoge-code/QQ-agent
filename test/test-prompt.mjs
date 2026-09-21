@@ -1,17 +1,23 @@
 // 提示词组装的单元自测：验证"零历史"成本模型的关键性质。
 import assert from 'node:assert';
-import { ChatStore } from '../src/store.js';
-import { MemoryStore } from '../src/memory.js';
-import { buildSystemPrompt, buildUserPrompt, buildPastState } from '../src/prompt.js';
-import { setRuntimeConfig, DEFAULT_CONFIG } from '../src/config.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// 先把数据目录指到临时目录，再动态拉业务模块：
+// DATA_DIR 在 config.js 被 import 的那一刻就固定，静态 import 会让这个测试往仓库的 data/ 里灌测试消息。
+process.env.QQ_AGENT_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-prompt-'));
+const { ChatStore } = await import('../src/store.js');
+const { MemoryStore } = await import('../src/memory.js');
+const { buildSystemPrompt, buildUserPrompt, buildPastState } = await import('../src/prompt.js');
+const { setRuntimeConfig, DEFAULT_CONFIG } = await import('../src/config.js');
 
 // 注入测试配置
 const cfg = structuredClone(DEFAULT_CONFIG);
 cfg.persona.botName = '测试机';
 cfg.persona.roleText = '你是测试群里的测试机。';
 cfg.persona.participation = 'medium';
-cfg.store.pastStateLimit = 80;
-cfg.store.pastStateMaxChars = 6000;
+cfg.store.allCount = 80;              // 【过去状态】条数上限（旧的 pastStateLimit / pastStateMaxChars 已废弃）
 cfg.sticker.enabled = true;
 setRuntimeConfig(cfg);
 
@@ -83,9 +89,10 @@ const userPrompt = buildUserPrompt({
   proactive: false
 });
 
-for (const section of ['【当前时间】', '【会话标识】', '【角色设定', '【此刻状态】', '【过去状态】', '【本次唤醒】', '【参与度参考】', '【记忆】', '【可用表情包】', '【引导说明】']) {
+for (const section of ['【角色设定', '【此刻状态】', '【过去状态】', '【本次唤醒】', '【记忆】', '【对群友的印象】', '【可用表情包】', '【引导说明】', '【当前时间】']) {
   assert.ok(userPrompt.includes(section), `用户提示缺少段落：${section}`);
 }
+assert.ok(userPrompt.indexOf('【当前时间】') > userPrompt.indexOf('【引导说明】'), '【当前时间】必须排在最后（它在末尾才不会废掉前面的缓存前缀）');
 for (const banned of ['沉睡前观察', 'qq_', '[SILENT]']) {
   assert.ok(!userPrompt.includes(banned), `用户提示不应包含：${banned}`);
 }
@@ -96,11 +103,14 @@ assert.ok(!past.text.includes('未读消息1'), '过去状态不应包含触发�
 assert.ok(past.text.includes('第100条消息'), '过去状态应包含历史消息');
 assert.ok(past.text.includes('我自己的一句话'), '过去状态应包含自己的发言');
 
-// ── 4. 预算控制：把预算调小后过去状态被截断 ──
-cfg.store.pastStateMaxChars = 1500;
+// ── 4. 读取条数上限：allCount 决定【过去状态】最多带几条（旧的 pastStateLimit/pastStateMaxChars 已废弃） ──
+const full = buildPastState(store, 'group:123', {});
+assert.equal(full.count, 80, `默认应读 80 条，实际 ${full.count}`);
+cfg.store.allCount = 5;
 const tiny = buildPastState(store, 'group:123', {});
-assert.ok(tiny.text.length <= 1600, `超预算：${tiny.text.length}`);
-cfg.store.pastStateMaxChars = 6000;
+assert.equal(tiny.count, 5, `allCount=5 时应只读 5 条，实际 ${tiny.count}`);
+assert.ok(tiny.text.length < full.text.length, '条数变少后文本应更短');
+cfg.store.allCount = 80;
 
 // ── 5. 零历史性质：整个用户提示里不出现"assistant 说过的话"这种 LLM 轮次结构 ──
 // （用户消息是单个字符串，不含 OpenAI messages 数组的历史角色）
@@ -120,5 +130,33 @@ assert.ok(DEFAULT_CONFIG.persona.roleText.includes('DeepSeek 小鲸鱼'), '默�
 for (const banned of ['[SILENT]', 'mcp__snowluma', 'qq_set_wake_config', 'qq_mark_read', 'qq_wait_for_messages', 'qq_send_message', '空格分隔（例如']) {
   assert.ok(!DEFAULT_CONFIG.persona.roleText.includes(banned), `默认人设不应包含旧架构指令：${banned}`);
 }
+
+// ── 8. 关掉表情包：系统提示要点明"没有表情能力"，用户提示不再注入表情目录 ──
+// 对应 sticker.enabled=false：看图工具也随之改为"只能看消息里的图"（见 prompt 的 qqSceneRules）
+cfg.sticker.enabled = false;
+setRuntimeConfig(cfg);
+const sysNoSticker = buildSystemPrompt();
+assert.ok(sysNoSticker.includes('表情包功能已被管理员关闭'), '关闭表情包后系统提示要说明没有表情能力');
+assert.ok(!sysNoSticker.includes('send_sticker="发表情"'), '关闭表情包后不应再举例 send_sticker');
+const userNoSticker = buildUserPrompt({
+  chatKey: 'group:123',
+  kind: 'group',
+  chatId: '123',
+  chatName: '测试群',
+  triggerEntries,
+  store,
+  memory,
+  stickerEntries: [{ id: 's1', desc: '滑稽', useCount: 3 }],
+  selfNickname: '测试机',
+  selfLastMessageAt: Date.now() - 30000,
+  lastMessageAt: Date.now(),
+  recentCount: 42,
+  runSeq: 9,
+  moreUnreadDuringRun: false,
+  proactive: false
+});
+assert.ok(!userNoSticker.includes('【可用表情包】'), '关闭表情包后用户提示不应再注入表情目录');
+cfg.sticker.enabled = true;
+setRuntimeConfig(cfg);
 
 console.log('✓ 提示词自测全部通过');

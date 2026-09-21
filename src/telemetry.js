@@ -106,6 +106,14 @@ export async function report(log) {
 }
 
 export function startTelemetryLoop(log = console.log) {
+  // 不想被统计就设 QQ_AGENT_NO_TELEMETRY=1。
+  // 服务器部署下"机器人主动外连第三方"这件事该由部署者自己决定，
+  // 不应该由程序替他默认打开。
+  if (process.env.QQ_AGENT_NO_TELEMETRY === '1') {
+    log('[遥测] QQ_AGENT_NO_TELEMETRY=1，已关闭匿名用量上报。');
+    return;
+  }
+
   const first = setTimeout(() => {
     report(log);
     const timer = setInterval(() => report(log), INTERVAL_MS);

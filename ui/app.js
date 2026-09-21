@@ -21,6 +21,8 @@ const state = {
   config: null,
   personaTemplates: {},
   status: null,
+  // 只读模式（服务器部署）：后端 READ_ONLY=1 时为 true，前端同步锁定配置入口
+  readonly: false,
   paused: false,
   pauseReason: null,
   autoFollowRunning: true,
@@ -105,6 +107,20 @@ const USAGE_RANGES = [
 ];
 
 const CONSOLE_MARKER = 'qq-agent-console';
+/*
+ * 只读模式下允许前端发起的写请求，与后端 src/app.js 的 READONLY_ALLOWED_WRITES
+ * 一一对应。后端本来就会 403，这里提前拦一道，只是把"HTTP 403"换成一句
+ * "该去哪儿改"的人话。
+ * 刻意放行：运营拨杆（暂停/恢复、唤醒一次、标已读、看图片）与记忆内容维护。
+ */
+const READONLY_ALLOWED_WRITES = [
+  /^\/api\/pause$/,
+  /^\/api\/chats\/(group|private)_\d+\/(wake|mark-read)$/,
+  /^\/api\/media-data$/,
+  /^\/api\/memory-files\/(group|private)_\d+\/members\/\d+$/,
+  /^\/api\/memory-files\/consolidate$/
+];
+const READONLY_HINT = '只读模式：控制台只做监控。改配置请在服务器上执行 docker compose exec qq-agent node bin/qq-agent.mjs（保存后自动热重载）';
 
 /* ══════════════════════════════════════════════════════════════
    主题（明/暗/系统/？）
@@ -190,12 +206,18 @@ function cycleTheme() {
   const order = THEME_VALUES;
   const next = order[(order.indexOf(getThemePref()) + 1) % order.length];
   applyTheme(next);
+  // 只读模式下后端禁止写：跳过回写，免得每次切主题都刷一条 403
+  if (state.readonly) return;
   // 尽力同步到后端，失败不影响本地使用
   api('/api/config', { method: 'POST', body: JSON.stringify({ ui: { theme: next } }) })
     .catch(() => { /* 后端不可达时静默：localStorage 已经生效 */ });
 }
 
 async function api(path, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  if (state.readonly && method !== 'GET' && !READONLY_ALLOWED_WRITES.some((re) => re.test(path))) {
+    throw new Error(READONLY_HINT);
+  }
   const res = await fetch(path, {
     headers: {
       'content-type': 'application/json',
@@ -254,13 +276,13 @@ async function pollUntilReady() {
   const startedAt = Date.now();
   try {
     const status = await api('/api/status');
-    if (!status.onebot?.connected) setLoadingStatus('SnowLuma 已就绪，正在连接 OneBot…');
+    if (!status.onebot?.connected) setLoadingStatus('后端已就绪，正在连接 OneBot…');
     else setLoadingStatus(`OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}，即将进入控制台…`);
     // 服务已可达，无需等到 OneBot 完全连上即可进入控制台（体检卡会继续提示）
     return true;
   } catch (e) {
     if (Date.now() - startedAt > 45000) {
-      setLoadingStatus('启动超时。请确认项目内 snowluma 文件夹完整，或到设置页手动启动 SnowLuma。');
+      setLoadingStatus('启动超时。请确认后端进程正在运行（服务器部署可看 docker compose logs），或刷新重试。');
       return false;
     }
     return false;
@@ -299,7 +321,7 @@ function assessReadiness(cfg, status) {
   const allowOk = (cfg.allow?.groups?.length || cfg.allow?.private?.length || cfg.allowAllWhenEmpty);
   checks.push({ ok: !!allowOk, label: allowOk ? `白名单：${(cfg.allow.groups || []).length} 个群 / ${(cfg.allow.private || []).length} 个好友` : '还没有配置白名单（必填）', fix: allowOk ? null : 'settings-allow' });
   const obOk = status?.onebot?.connected;
-  checks.push({ ok: !!obOk, label: obOk ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}` : 'OneBot（SnowLuma）未连接 —— 请到 SnowLuma 页签启动', fix: obOk ? null : 'snowluma-tab' });
+  checks.push({ ok: !!obOk, label: obOk ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}` : 'OneBot 协议端未连接 —— 请确认协议端（SnowLuma / NapCat 等）已在运行', fix: obOk ? null : 'snowluma-tab' });
   return { ready: urlOk && modelOk && allowOk && obOk, checks };
 }
 
@@ -314,7 +336,7 @@ function renderBanner() {
     html = '⏸ 机器人已暂停，不会处理任何消息。';
   } else if (s && !s.onebot.connected && !s.onebot.everConnected) {
     show = true;
-    html = '🔌 OneBot（SnowLuma）还没连上：请确认 SnowLuma 已启动，且设置里的 WS/HTTP 地址正确。';
+    html = '🔌 OneBot 协议端还没连上：请确认协议端（SnowLuma / NapCat 等）在运行，且 WS/HTTP 地址正确。';
   }
   banner.classList.toggle('hidden', !show);
   if (show) {
@@ -360,6 +382,18 @@ function switchTab(name) {
 }
 
 // ── 状态栏 ──
+/**
+ * 只读模式开关：同步 state 与顶部横幅。
+ * 控件锁定的视觉效果由 style.css 的 body.readonly 规则负责；
+ * 真正的拦截在 api() 与后端，这里只是让"点了没反应"变成"一眼看出不能点"。
+ */
+function applyReadonly(on) {
+  state.readonly = on === true;
+  document.body.classList.toggle('readonly', state.readonly);
+  const strip = $('#ro-strip');
+  if (strip) strip.classList.toggle('hidden', !state.readonly);
+}
+
 async function refreshStatus() {
   try {
     state.status = await api('/api/status');
@@ -381,6 +415,7 @@ async function refreshStatus() {
     $('#search-count-label').textContent = `搜索：${s.webSearchCount ?? u.webSearchCount ?? 0} 次`;
     state.paused = s.paused;
     state.pauseReason = s.pauseReason;
+    applyReadonly(s.readonly);
     $('#pause-btn').textContent = state.paused ? '恢复' : '暂停';
     renderBanner();
   } catch (e) { /* 忽略瞬时错误 */ }
@@ -1197,8 +1232,8 @@ function renderChatMessages() {
     <div class="chat-toolbar">
       <button class="btn btn-small" id="chat-wake-btn">唤醒一次处理</button>
       <button class="btn btn-small" id="chat-read-btn">全部标为已读</button>
-      <input type="text" id="test-send-text" placeholder="手动发一条测试消息" style="flex:1" />
-      <button class="btn btn-small" id="chat-testsend-btn">发送</button>
+      ${state.readonly ? '' : `<input type="text" id="test-send-text" placeholder="手动发一条测试消息" style="flex:1" />
+      <button class="btn btn-small" id="chat-testsend-btn">发送</button>`}
     </div>
     <table class="archive-table"><tbody id="chat-msg-body"></tbody></table>
     <div class="list-more muted" id="chat-msg-more"></div>`;
@@ -1214,7 +1249,8 @@ function renderChatMessages() {
     // 保持视图：用户可能已经滚到中间了，别把他弹回顶部
     loadChatMessages(key, { keepView: true });
   });
-  $('#chat-testsend-btn').addEventListener('click', async () => {
+  // 只读模式下这个按钮不渲染（后端也会拒绝 test-send），用可选调用兜住
+  $('#chat-testsend-btn')?.addEventListener('click', async () => {
     const input = $('#test-send-text');
     const text = input.value.trim();
     if (!text) return;
@@ -2706,10 +2742,15 @@ function renderSettingsSection(c) {
     onebot: () => renderOnebotSection(c)
   };
   const render = sections[sec] || sections.api;
+  // 只读模式下后端拒绝一切配置写入：按钮一起禁掉，并把"去哪儿改"写在旁边
+  const roNote = state.readonly
+    ? '<span class="muted readonly-note">只读模式：配置已锁定，请在服务器上执行 <code>docker compose exec qq-agent node bin/qq-agent.mjs</code> 修改（保存后自动热重载）</span>'
+    : '';
   return `
     <div class="save-bar">
-      <button class="btn btn-primary" id="save-cfg-btn">保存设置</button>
+      <button class="btn btn-primary" id="save-cfg-btn"${state.readonly ? ' disabled' : ''}>保存设置</button>
       <span id="cfg-save-result" class="muted"></span>
+      ${roNote}
     </div>
     ${render()}`;
 }
