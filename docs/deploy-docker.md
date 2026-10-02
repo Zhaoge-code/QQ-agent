@@ -369,7 +369,7 @@ docker compose up -d --build
 | 消息收得到、但一条也发不出去 | NapCat 的 **HTTP 服务器**没开（动作走 HTTP、事件走 WS），或 `set-onebot --http` 地址不对。先看 `./napcat/config/onebot11*.json` 里 `httpServers` 是不是 `enable: true` |
 | 打不开 NapCat 的 WebUI | 隧道转发的应该是 `6099`（控制台是 `8321`）；token 在 `docker compose logs napcat` 里 |
 | napcat 反复重启 / 写文件报权限错 | `./napcat/` 的属主和 `NAPCAT_UID`/`NAPCAT_GID` 对不上：`sudo chown -R $(id -u):$(id -g) napcat/`，或把这两个值写进 `.env` 再 `docker compose up -d napcat` |
-| 容器一重建就要重新扫码 | ① 登录态目录没挂上 / 被删 / 属主不对，`./napcat/QQ` 是空的；② 上次退出是被 SIGKILL 打断的，会话没写干净 | ① 确认 `./napcat/QQ` 非空（几十 MB，里面有 `nt_qq_*` 之类目录）且属主 = `id -u`/`id -g`（它在 `.gitignore` 里，不会被 git 清掉）；② compose 里 napcat 已给 `stop_grace_period: 30s`，重启用 `docker compose restart napcat`，别用 `down && up` |
+| 容器一重建就要重新扫码 | ① 登录态目录没挂上 / 被删 / 属主不对，`./napcat/QQ` 是空的；② 上次退出是被 SIGKILL 打断的，会话没写干净；③ 容器重建换了 MAC / hostname，QQ 当成新设备 | ① 确认 `./napcat/QQ` 非空（几十 MB～几百 MB）且属主 = `id -u`/`id -g`（它在 `.gitignore` 里，不会被 git 清掉）；② compose 里 napcat 已给 `stop_grace_period: 30s`，重启用 `docker compose restart napcat`，别用 `down && up`；③ compose 里已固定 `hostname` + `mac_address` |
 | 登录页提示 QQ 版本过低 / 登不上 | 镜像里的 QQ 或 NapCat 太旧：改 `image:` 成一个更新的版本 tag，再 `docker compose up -d napcat`（别用 `latest`，出事时说不清版本） |
 | 服务器上 `docker build` 卡在 npm | 用 `--build-arg NPM_REGISTRY=https://registry.npmmirror.com`，或本地构建好再 `docker save` / `load` 过去 |
 
@@ -399,6 +399,7 @@ docker compose up -d --build
 | 改了 `config.json` 里的人设，群里还是老口气 | 手工改文件不会自动重载；另外已经开始的那一轮用的还是旧提示词 | `docker compose exec qq-agent node bin/qq-agent.mjs reload`（见「改提示词 / 人设后怎么生效」） |
 | NapCat 跑久了收不到新消息（连接还在，日志里只剩 `ServerTime` 对时，没有任何 `接收 <-` 行） | NTQQ 长连的已知毛病：会话假死，QQ 服务端不再推消息。qq-agent 这边看不出来（WS 还连着，状态仍是 connected），它只负责被动接收 | `docker compose restart napcat` 就能恢复；反复出现就定时重启，例如 cron：`0 5 * * * cd /root/qq-agent && docker compose restart napcat >> /var/log/napcat-restart.log 2>&1` |
 | 重启 NapCat 后必须重新扫码 | 两种原因得分清：① 登录态压根没落盘（`./napcat/QQ` 是空的或属主不对）；② 会话已被服务端判废（目录里明明有几十 MB 数据，重启后日志里却直接出二维码） | ① 按「7. 排障」里那条修挂载与属主；② 只能重扫 —— 顺手把 `stop_grace_period` 留够（compose 里已给 30s），别让 SIGKILL 打断 QQ 收尾 |
+| 登录态目录明明有 200+ MB，重启后还是要重新扫码 | 会话数据在，但服务端不认它了。① 容器**重建**换了 MAC / hostname，被当成新设备；② 上次是先"假死"再重启的，服务端早就把会话判废了 | ① compose 里已固定 `hostname` + `mac_address`；② 平时用 `docker compose restart napcat`（不重建容器、走 30 秒优雅收尾），能改 WebUI 里的配置就别重建；③ 判定方法见下：`restart` 免扫、`up -d` 要扫 = 设备指纹问题；两者都要扫 = 服务端判废，只能重扫 |
 
 四条事后经验：
 

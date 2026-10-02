@@ -1,4 +1,4 @@
-# QQ Agent（桌面端 / Linux 服务器）
+# QQ Agent（桌面端 / Linux 服务器）（100%AI，无手搓）
 
 > **这个仓库是 [K0nd1us/QQ-agent](https://github.com/K0nd1us/QQ-agent) 的 fork**：桌面版的功能全部来自上游  
 > 本 fork 用于解决自用电脑无法长时保持开机状态，导致QQ聊天机器人只能在有限时间内活跃在QQ群聊中的状态  

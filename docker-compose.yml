@@ -82,6 +82,10 @@ services:
     # 给收尾留足时间：默认只等 10 秒，超时会被 SIGKILL —— QQ 来不及把会话写干净，
     # 下次启动就可能要重新扫码。20~30 秒基本都能收干净。
     stop_grace_period: 30s
+    # 固定"设备身份"：QQ 的登录 token 绑设备指纹，容器一重建 MAC 和 hostname 就换了，
+    # 服务端会把它当成新设备 → 必须重新扫码。这两行让重建前后看起来是同一台机器。
+    hostname: napcat
+    mac_address: "02:42:ac:1f:00:99"
     logging:
       driver: json-file
       options:
